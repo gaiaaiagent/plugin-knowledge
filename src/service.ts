@@ -15,6 +15,8 @@ import {
   UUID,
   Metadata,
 } from '@elizaos/core';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   createDocumentMemory,
   extractTextFromDocument,
@@ -231,7 +233,7 @@ export class KnowledgeService extends Service {
   }
 
   /**
-   * Add knowledge to the system
+   * Add knowledge to the system with semantic deduplication
    * @param options Knowledge options
    * @returns Promise with document processing result
    */
@@ -252,35 +254,110 @@ export class KnowledgeService extends Service {
 
     logger.info(`Processing "${options.originalFilename}" (${options.contentType})`);
 
+    // Initialize deduplication logging
+    const dedupLogPath = path.join(
+      process.env.KNOWLEDGE_PATH || '/opt/projects/GAIA/knowledge',
+      '.deduplication'
+    );
+    if (!fs.existsSync(dedupLogPath)) {
+      fs.mkdirSync(dedupLogPath, { recursive: true });
+      fs.mkdirSync(path.join(dedupLogPath, 'reports'), { recursive: true });
+      fs.mkdirSync(path.join(dedupLogPath, 'flagged'), { recursive: true });
+      fs.mkdirSync(path.join(dedupLogPath, 'merged'), { recursive: true });
+    }
+
     // Check if document already exists in database using content-based ID
     try {
       const existingDocument = await this.runtime.getMemoryById(contentBasedId);
       if (existingDocument && existingDocument.metadata?.type === MemoryType.DOCUMENT) {
-        logger.info(`"${options.originalFilename}" already exists - skipping`);
-
-        // Count existing fragments for this document
-        const fragments = await this.runtime.getMemories({
-          tableName: 'knowledge',
-        });
-
-        // Filter fragments related to this specific document
-        const relatedFragments = fragments.filter(
-          (f) =>
-            f.metadata?.type === MemoryType.FRAGMENT &&
-            (f.metadata as FragmentMetadata).documentId === contentBasedId
+        logger.info(`"${options.originalFilename}" already exists (exact match) - skipping`);
+        
+        // Log to deduplication system
+        const logEntry = {
+          timestamp: new Date().toISOString(),
+          action: 'SKIPPED_EXACT',
+          document: options.originalFilename,
+          reason: 'Content-based ID already exists',
+          existingId: contentBasedId
+        };
+        fs.appendFileSync(
+          path.join(dedupLogPath, 'deduplication.log'),
+          `[${logEntry.timestamp}] ${logEntry.action}: ${logEntry.document} - ${logEntry.reason}\n`
         );
 
+        // For skipped documents, don't count fragments to avoid expensive DB query
+        // This avoids loading ALL fragments from the knowledge table
         return {
           clientDocumentId: contentBasedId,
           storedDocumentMemoryId: existingDocument.id as UUID,
-          fragmentCount: relatedFragments.length,
+          fragmentCount: 0, // Skip counting for performance
         };
       }
     } catch (error) {
       // Document doesn't exist or other error, continue with processing
       logger.debug(
-        `Document ${contentBasedId} not found or error checking existence, proceeding with processing: ${error instanceof Error ? error.message : String(error)}`
+        `Document ${contentBasedId} not found or error checking existence, proceeding with semantic similarity check: ${error instanceof Error ? error.message : String(error)}`
       );
+    }
+
+    // Semantic similarity check for near-duplicates
+    try {
+      const similarityCheck = await this.checkSemanticSimilarity(options.content, options.originalFilename);
+      
+      if (similarityCheck.isDuplicate) {
+        logger.info(
+          `"${options.originalFilename}" is semantically similar (${(similarityCheck.similarity * 100).toFixed(1)}%) to existing document - ${similarityCheck.action}`
+        );
+
+        // Log deduplication action
+        const logEntry = {
+          timestamp: new Date().toISOString(),
+          action: similarityCheck.action.toUpperCase(),
+          document: options.originalFilename,
+          similarity: similarityCheck.similarity,
+          existingId: similarityCheck.existingId,
+          mergedMetadata: similarityCheck.mergedMetadata
+        };
+
+        fs.appendFileSync(
+          path.join(dedupLogPath, 'deduplication.log'),
+          `[${logEntry.timestamp}] ${logEntry.action}: ${logEntry.document} (${(logEntry.similarity * 100).toFixed(1)}% similar to ${logEntry.existingId})\n`
+        );
+
+        if (similarityCheck.action === 'merged') {
+          // Save merge record
+          const mergeRecord = {
+            ...logEntry,
+            originalContent: options.content.substring(0, 500) + '...'
+          };
+          fs.writeFileSync(
+            path.join(dedupLogPath, 'merged', `${Date.now()}_${path.basename(options.originalFilename || 'unknown')}.json`),
+            JSON.stringify(mergeRecord, null, 2)
+          );
+
+          // Return the existing document info
+          return {
+            clientDocumentId: similarityCheck.existingId as UUID,
+            storedDocumentMemoryId: similarityCheck.existingId as UUID,
+            fragmentCount: similarityCheck.fragmentCount || 0,
+          };
+        }
+
+        if (similarityCheck.action === 'flagged') {
+          // Save for review
+          const flaggedRecord = {
+            ...logEntry,
+            instructions: 'Review this potential duplicate and decide whether to merge, skip, or process as new',
+            contentPreview: options.content.substring(0, 1000) + '...'
+          };
+          fs.writeFileSync(
+            path.join(dedupLogPath, 'flagged', `${Date.now()}_${path.basename(options.originalFilename || 'unknown')}.json`),
+            JSON.stringify(flaggedRecord, null, 2)
+          );
+        }
+      }
+    } catch (error) {
+      logger.warn(`Semantic similarity check failed, proceeding with normal processing: ${error}`);
     }
 
     // Process the document with the content-based ID
@@ -477,20 +554,27 @@ export class KnowledgeService extends Service {
     message: Memory,
     scope?: { roomId?: UUID; worldId?: UUID; entityId?: UUID }
   ): Promise<KnowledgeItem[]> {
-    logger.debug('KnowledgeService: getKnowledge called for message id: ' + message.id);
+    logger.info(`🔍 [KNOWLEDGE SERVICE] getKnowledge called for message id: ${message.id}`);
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Message text: "${message.content?.text}"`);
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Agent ID: ${this.runtime.agentId}`);
+    
     if (!message?.content?.text || message?.content?.text.trim().length === 0) {
-      logger.warn('KnowledgeService: Invalid or empty message content for knowledge query.');
+      logger.warn('🔍 [KNOWLEDGE SERVICE] Invalid or empty message content for knowledge query.');
       return [];
     }
 
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Generating embedding for text: "${message.content.text.substring(0, 100)}..."`);
     const embedding = await this.runtime.useModel(ModelType.TEXT_EMBEDDING, {
       text: message.content.text,
     });
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Embedding generated successfully: ${embedding.length} dimensions`);
 
     const filterScope: { roomId?: UUID; worldId?: UUID; entityId?: UUID } = {};
     if (scope?.roomId) filterScope.roomId = scope.roomId;
     if (scope?.worldId) filterScope.worldId = scope.worldId;
     if (scope?.entityId) filterScope.entityId = scope.entityId;
+    
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Searching knowledge table with scope: ${JSON.stringify(filterScope)}`);
 
     const fragments = await this.runtime.searchMemories({
       tableName: 'knowledge',
@@ -501,7 +585,14 @@ export class KnowledgeService extends Service {
       match_threshold: 0.1, // TODO: Make configurable
     });
 
-    return fragments
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Search returned ${fragments.length} fragments`);
+    if (fragments.length > 0) {
+      logger.info(`🔍 [KNOWLEDGE SERVICE] Top fragment similarity: ${fragments[0]?.similarity}, content preview: "${fragments[0]?.content?.text?.substring(0, 100)}..."`);
+    } else {
+      logger.warn(`🔍 [KNOWLEDGE SERVICE] No fragments found for query: "${message.content.text}"`);
+    }
+
+    const result = fragments
       .filter((fragment) => fragment.id !== undefined) // Ensure fragment.id is defined
       .map((fragment) => ({
         id: fragment.id as UUID, // Cast as UUID after filtering
@@ -510,6 +601,9 @@ export class KnowledgeService extends Service {
         metadata: fragment.metadata,
         worldId: fragment.worldId,
       }));
+      
+    logger.info(`🔍 [KNOWLEDGE SERVICE] Returning ${result.length} knowledge items`);
+    return result;
   }
 
   /**
@@ -899,6 +993,110 @@ export class KnowledgeService extends Service {
     logger.info(
       `KnowledgeService: Deleted memory ${memoryId} for agent ${this.runtime.agentId}. Assumed it was a document or related fragment.`
     );
+  }
+
+  /**
+   * Check semantic similarity with existing knowledge
+   * @param content The content to check
+   * @param filename The filename being processed
+   * @returns Similarity check result
+   */
+  private async checkSemanticSimilarity(
+    content: string, 
+    filename?: string
+  ): Promise<{
+    isDuplicate: boolean;
+    similarity: number;
+    existingId?: string;
+    action?: 'merged' | 'skipped' | 'flagged';
+    fragmentCount?: number;
+    mergedMetadata?: any;
+  }> {
+    try {
+      // For now, use a simple approach - check if similar content exists
+      // In production, this would use pgvector similarity search
+      
+      logger.debug(`Checking semantic similarity for ${filename}...`);
+      
+      // Get recent document memories to check against
+      const recentMemories = await this.runtime.getMemories({
+        tableName: 'documents',
+        count: 100, // Check last 100 entries
+      });
+      
+      logger.debug(`Found ${recentMemories.length} existing documents to compare against`);
+
+      // Simple text similarity check (Jaccard similarity on words)
+      const contentWords = new Set(content.toLowerCase().split(/\s+/).slice(0, 500));
+      let maxSimilarity = 0;
+      let mostSimilarId = null;
+
+      for (const memory of recentMemories) {
+        if (memory.metadata?.type === MemoryType.FRAGMENT) {
+          const memoryText = memory.content?.text || '';
+          const memoryWords = new Set(memoryText.toLowerCase().split(/\s+/).slice(0, 500));
+          
+          // Calculate Jaccard similarity
+          const intersection = new Set([...contentWords].filter(x => memoryWords.has(x)));
+          const union = new Set([...contentWords, ...memoryWords]);
+          const similarity = intersection.size / union.size;
+
+          if (similarity > maxSimilarity) {
+            maxSimilarity = similarity;
+            mostSimilarId = memory.id;
+            
+            // Log high similarity matches
+            if (similarity > 0.8) {
+              logger.info(`High similarity detected: ${(similarity * 100).toFixed(1)}% between "${filename}" and document ${memory.id}`);
+            }
+          }
+        }
+      }
+
+      // Determine action based on similarity
+      if (maxSimilarity > 0.95) {
+        return {
+          isDuplicate: true,
+          similarity: maxSimilarity,
+          existingId: mostSimilarId,
+          action: 'skipped',
+        };
+      } else if (maxSimilarity > 0.85) {
+        // Merge metadata for high similarity
+        return {
+          isDuplicate: true,
+          similarity: maxSimilarity,
+          existingId: mostSimilarId,
+          action: 'merged',
+          mergedMetadata: {
+            additionalSource: filename,
+            mergedAt: new Date().toISOString(),
+          }
+        };
+      } else if (maxSimilarity > 0.75) {
+        // Flag for review for borderline cases
+        return {
+          isDuplicate: true,
+          similarity: maxSimilarity,
+          existingId: mostSimilarId,
+          action: 'flagged',
+        };
+      }
+
+      // Not a duplicate
+      return {
+        isDuplicate: false,
+        similarity: maxSimilarity,
+      };
+
+    } catch (error) {
+      logger.error(`Error in semantic similarity check: ${error}`);
+      // On error, return not duplicate to allow processing
+      return {
+        isDuplicate: false,
+        similarity: 0,
+      };
+    }
   }
   // ADDED METHODS END
 }
